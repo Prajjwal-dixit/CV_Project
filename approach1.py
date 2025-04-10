@@ -1,20 +1,23 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
+
+# Streamlit App Setup
+st.title("Traffic Density Estimator")
+video_file = st.file_uploader("Upload a video", type=["mp4", "avi", "mov"])
 
 # Constants
 MIN_CONTOUR_AREA = 800
-VIDEO_SOURCE = "video.mp4"  # Replace with your video file path
 IOU_THRESHOLD_NMS = 0.3
 MAX_MISSED_FRAMES = 10
 
-# Initialize Background Subtractor
-bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
-persistent_detections = []
-prev_frame = None
+# Initialize variables in session state
+if 'prev_frame' not in st.session_state:
+    st.session_state.prev_frame = None
+if 'persistent_detections' not in st.session_state:
+    st.session_state.persistent_detections = []
 
-# --- Helper Functions ---
+# Helper Functions
 def compute_iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
@@ -25,32 +28,26 @@ def compute_iou(boxA, boxB):
     interArea = interW * interH
     boxAArea = boxA[2] * boxA[3]
     boxBArea = boxB[2] * boxB[3]
-    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-5)
-    return iou
+    return interArea / float(boxAArea + boxBArea - interArea + 1e-5)
 
 def non_max_suppression_fast(boxes, overlap_thresh):
     if len(boxes) == 0:
         return []
     boxes_arr = np.array([[x, y, x + w, y + h] for (x, y, w, h) in boxes], dtype=float)
     pick = []
-    x1 = boxes_arr[:, 0]
-    y1 = boxes_arr[:, 1]
-    x2 = boxes_arr[:, 2]
-    y2 = boxes_arr[:, 3]
+    x1, y1, x2, y2 = boxes_arr[:, 0], boxes_arr[:, 1], boxes_arr[:, 2], boxes_arr[:, 3]
     area = (x2 - x1 + 1) * (y2 - y1 + 1)
     idxs = np.argsort(y2)
+
     while len(idxs) > 0:
         last = idxs[-1]
         pick.append(last)
         suppress = [len(idxs) - 1]
         for pos in range(len(idxs) - 1):
             i = idxs[pos]
-            xx1 = max(x1[last], x1[i])
-            yy1 = max(y1[last], y1[i])
-            xx2 = min(x2[last], x2[i])
-            yy2 = min(y2[last], y2[i])
-            w_ = max(0, xx2 - xx1 + 1)
-            h_ = max(0, yy2 - yy1 + 1)
+            xx1, yy1 = max(x1[last], x1[i]), max(y1[last], y1[i])
+            xx2, yy2 = min(x2[last], x2[i]), min(y2[last], y2[i])
+            w_, h_ = max(0, xx2 - xx1 + 1), max(0, yy2 - yy1 + 1)
             overlap = float(w_ * h_) / area[i]
             if overlap > overlap_thresh:
                 suppress.append(pos)
@@ -58,10 +55,10 @@ def non_max_suppression_fast(boxes, overlap_thresh):
     return [boxes[i] for i in pick]
 
 def update_persistent_detections(current_boxes):
-    global persistent_detections
     updated = []
     matched_current = [False] * len(current_boxes)
-    for detection in persistent_detections:
+
+    for detection in st.session_state.persistent_detections:
         best_iou = 0
         best_idx = -1
         for idx, curr_box in enumerate(current_boxes):
@@ -78,85 +75,74 @@ def update_persistent_detections(current_boxes):
             detection['age'] += 1
             if detection['age'] <= MAX_MISSED_FRAMES:
                 updated.append(detection)
+
     for idx, flag in enumerate(matched_current):
         if not flag:
             updated.append({'box': current_boxes[idx], 'age': 0})
-    persistent_detections = updated
+    
+    st.session_state.persistent_detections = updated
 
-# --- Streamlit App ---
-st.title("🚗 Real-time Traffic Density Detection")
+# Video Processing
+if video_file:
+    tfile = open("temp_video.mp4", 'wb')
+    tfile.write(video_file.read())
+    cap = cv2.VideoCapture("temp_video.mp4")
 
-start = st.button("Start Traffic Analysis")
+    bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
+    frame_display = st.empty()
 
-frame_placeholder = st.empty()
-info_placeholder = st.empty()
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-if start:
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
-    if not cap.isOpened():
-        st.error("Error: Could not open video.")
-    else:
-        global prev_frame
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                st.warning("Video ended or error reading video.")
-                break
+        frame = cv2.resize(frame, (800, 600))
+        fg_mask = bg_subtractor.apply(frame, learningRate=0.005)
 
-            frame = cv2.resize(frame, (800, 600))
-            fg_mask = bg_subtractor.apply(frame, learningRate=0.005)
+        # Frame differencing
+        if st.session_state.prev_frame is not None:
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_prev = cv2.cvtColor(st.session_state.prev_frame, cv2.COLOR_BGR2GRAY)
+            diff = cv2.absdiff(gray_frame, gray_prev)
+            _, diff_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            fg_mask = cv2.bitwise_or(fg_mask, diff_mask)
 
-            if prev_frame is not None:
-                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                gray_prev = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-                diff = cv2.absdiff(gray_frame, gray_prev)
-                _, diff_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-                fg_mask = cv2.bitwise_or(fg_mask, diff_mask)
-            prev_frame = frame.copy()
+        st.session_state.prev_frame = frame.copy()
 
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=2)
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_DILATE, kernel, iterations=2)
+        # Morphological ops
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_DILATE, kernel, iterations=2)
 
-            contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            current_boxes = []
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < MIN_CONTOUR_AREA:
-                    continue
-                x, y, w, h = cv2.boundingRect(cnt)
-                current_boxes.append((x, y, w, h))
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        current_boxes = [(x, y, w, h) for cnt in contours if cv2.contourArea(cnt) > MIN_CONTOUR_AREA
+                         for (x, y, w, h) in [cv2.boundingRect(cnt)]]
 
-            current_boxes = non_max_suppression_fast(current_boxes, IOU_THRESHOLD_NMS)
-            update_persistent_detections(current_boxes)
-            final_boxes = [d['box'] for d in persistent_detections]
+        current_boxes = non_max_suppression_fast(current_boxes, IOU_THRESHOLD_NMS)
+        update_persistent_detections(current_boxes)
 
-            for (x, y, w, h) in final_boxes:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        final_boxes = [d['box'] for d in st.session_state.persistent_detections]
 
-            vehicle_area = sum([w * h for (x, y, w, h) in final_boxes])
-            road_area = frame.shape[0] * frame.shape[1]
-            density_ratio = vehicle_area / road_area
+        for (x, y, w, h) in final_boxes:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-            if density_ratio < 0.2:
-                density = "LOW"
-                density_color = (0, 255, 0)
-            elif density_ratio < 0.5:
-                density = "MEDIUM"
-                density_color = (0, 255, 255)
-            else:
-                density = "HIGH"
-                density_color = (0, 0, 255)
+        vehicle_area = sum([w * h for (x, y, w, h) in final_boxes])
+        road_area = frame.shape[0] * frame.shape[1]
+        density_ratio = vehicle_area / road_area
 
-            cv2.putText(frame, f"Detected vehicles: {len(final_boxes)}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, f"Traffic density: {density}", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, density_color, 2, cv2.LINE_AA)
+        if density_ratio < 0.2:
+            density, color = "LOW", (0, 255, 0)
+        elif density_ratio < 0.5:
+            density, color = "MEDIUM", (0, 255, 255)
+        else:
+            density, color = "HIGH", (0, 0, 255)
 
-            # Convert frame for Streamlit display
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_img = Image.fromarray(frame_rgb)
-            frame_placeholder.image(frame_img, caption="Traffic Analysis", use_column_width=True)
-            info_placeholder.text(f"Traffic Density: {density} | Vehicles Detected: {len(final_boxes)}")
+        cv2.putText(frame, f"Detected vehicles: {len(final_boxes)}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"Traffic density: {density}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-        cap.release()
+        # Convert BGR to RGB and display
+        frame_display.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+
+    cap.release()
